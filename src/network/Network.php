@@ -32,7 +32,7 @@ class Network {
     /** @var NetworkSession[] Track active player sessions across all historical versions */
     private array $sessions = [];
 
-    private array $translatorCache
+    private array $translatorCache = [];
     /**
      * Entry point where every raw network packet hits the server port directly.
      */
