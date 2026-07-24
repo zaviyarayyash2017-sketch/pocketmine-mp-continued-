@@ -10,207 +10,124 @@
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU Lesser General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * @author PocketMine Team
- * @link http://www.pocketmine.net/
- *
- *
- */
+ * the Free Software
+<?php
 
 declare(strict_types=1);
 
-/**
- * Network-related classes
- */
 namespace pocketmine\network;
 
-use pocketmine\event\server\NetworkInterfaceRegisterEvent;
-use pocketmine\event\server\NetworkInterfaceUnregisterEvent;
-use pocketmine\utils\Utils;
-use function base64_encode;
-use function get_class;
-use function preg_match;
-use function spl_object_id;
-use function time;
-use const PHP_INT_MAX;
+use pocketmine\network\mcpe\NetworkSession;
+use pocketmine\network\translators\v0_7_4\AlphaTranslator;
+use pocketmine\utils\SingletonTrait;
 
-class Network{
-	/** @var NetworkInterface[] */
-	private array $interfaces = [];
+class Network {
+    use SingletonTrait;
 
-	/** @var AdvancedNetworkInterface[] */
-	private array $advancedInterfaces = [];
+    /** @var int[] Maps active connection identifiers (IP:Port) to their determined protocol versions */
+    private array $connectionProtocols = [];
 
-	/** @var RawPacketHandler[] */
-	private array $rawPacketHandlers = [];
+    /** @var NetworkSession[] Track sessions manually for multi-version routing overrides */
+    private array $sessions = [];
 
-	/**
-	 * @var int[]
-	 * @phpstan-var array<string, int>
-	 */
-	private array $bannedIps = [];
+    /**
+     * This is the main entry point where EVERY raw network packet lands 
+     * directly from the internet socket interface.
+     */
+    public function processRawPacket(string $address, int $port, string $buffer) : void {
+        // Create a unique key for this specific player connection
+        $connectionId = $address . ":" . $port;
+        
+        // Safety check: Avoid crashing if empty data hits the port
+        if (strlen($buffer) < 1) {
+            return;
+        }
 
-	private BidirectionalBandwidthStatsTracker $bandwidthTracker;
-	private string $name;
-	private NetworkSessionManager $sessionManager;
+        // Read the absolute first byte (The Packet ID Header)
+        $packetId = ord($buffer);
 
-	public function __construct(
-		private \Logger $logger
-	){
-		$this->sessionManager = new NetworkSessionManager();
-		$this->bandwidthTracker = new BidirectionalBandwidthStatsTracker(5);
-	}
+        // =================================================================
+        // PHASE 1: ROUTING NEW OR EXISTING ALPHA CLIENTS (v0.6.1 - v0.7.4)
+        // =================================================================
+        
+        // Old alpha clients initiated connections with raw UDP bytes like 0x05, 0x06, or 0x09.
+        // They completely lack modern RakNet packet encapsulation headers.
+        if ($packetId === 0x05 || $packetId === 0x06 || $packetId === 0x09 || 
+            (isset($this->connectionProtocols[$connectionId]) && $this->connectionProtocols[$connectionId] < 20)) {
+            
+            // If it's a brand new alpha connection, log and track it
+            if (!isset($this->connectionProtocols[$connectionId])) {
+                // Protocol 7 represents early MCPE Alpha editions
+                $this->connectionProtocols[$connectionId] = 7; 
+                \pocketmine\Server::getInstance()->getLogger()->info("[$connectionId] Routing to Legacy Alpha Pipeline...");
+            }
 
-	public function getBandwidthTracker() : BidirectionalBandwidthStatsTracker{ return $this->bandwidthTracker; }
+            // Route to your custom Alpha translation class
+            $alphaPipeline = new AlphaTranslator();
+            $modernPacket = $alphaPipeline->translateInbound($buffer);
 
-	/**
-	 * @return NetworkInterface[]
-	 */
-	public function getInterfaces() : array{
-		return $this->interfaces;
-	}
+            if ($modernPacket !== null) {
+                // Find or create their session and pass the forged modern packet safely to the engine
+                $session = $this->getSessionByAddress($address, $port);
+                if ($session !== null) {
+                    $session->handleInboundPacket($modernPacket);
+                }
+            }
+            return; // HALT. Do not let modern PocketMine code process this raw buffer.
+        }
 
-	public function getSessionManager() : NetworkSessionManager{
-		return $this->sessionManager;
-	}
+        // =================================================================
+        // PHASE 2: ROUTING MODERN CLIENTS (v1.26.30+)
+        // =================================================================
+        
+        // Modern Bedrock packets ALWAYS wrap game data inside a compressed batch packet (0xfe)
+        if ($packetId === 0xfe) {
+            if (!isset($this->connectionProtocols[$connectionId])) {
+                // Track this connection as a modern client version
+                $this->connectionProtocols[$connectionId] = 770; // Modern protocol number for 1.26.x
+                \pocketmine\Server::getInstance()->getLogger()->info("[$connectionId] Routing to Modern v1.26.30 Pipeline...");
+            }
 
-	public function getConnectionCount() : int{
-		return $this->sessionManager->getSessionCount();
-	}
+            // Allow the modern, vanilla PocketMine logic to proceed safely
+            $session = $this->getSessionByAddress($address, $port);
+            if ($session !== null) {
+                // Pass directly to vanilla network processor
+                $session->handleEncodedPacket($buffer);
+            }
+            return;
+        }
 
-	public function getValidConnectionCount() : int{
-		return $this->sessionManager->getValidSessionCount();
-	}
+        // =================================================================
+        // PHASE 3: UNKNOWN PROTOCOLS (CATCH-ALL DROPS)
+        // =================================================================
+        return;
+    }
 
-	public function tick() : void{
-		foreach($this->interfaces as $interface){
-			$interface->tick();
-		}
+    /**
+     * Resolves a NetworkSession for a specific address and port
+     */
+    public function getSessionByAddress(string $address, int $port) : ?NetworkSession {
+        $connectionId = $address . ":" . $port;
+        if (!isset($this->sessions[$connectionId])) {
+            return null;
+        }
+        return $this->sessions[$connectionId];
+    }
 
-		$this->sessionManager->tick();
-	}
+    /**
+     * Registers a session when a connection initializes
+     */
+    public function registerSession(string $address, int $port, NetworkSession $session) : void {
+        $connectionId = $address . ":" . $port;
+        $this->sessions[$connectionId] = $session;
+    }
 
-	/**
-	 * @throws NetworkInterfaceStartException
-	 */
-	public function registerInterface(NetworkInterface $interface) : bool{
-		$ev = new NetworkInterfaceRegisterEvent($interface);
-		$ev->call();
-		if(!$ev->isCancelled()){
-			$interface->start();
-			$this->interfaces[$hash = spl_object_id($interface)] = $interface;
-			if($interface instanceof AdvancedNetworkInterface){
-				$this->advancedInterfaces[$hash] = $interface;
-				$interface->setNetwork($this);
-				foreach(Utils::stringifyKeys($this->bannedIps) as $ip => $until){
-					$interface->blockAddress($ip);
-				}
-				foreach($this->rawPacketHandlers as $handler){
-					$interface->addRawPacketFilter($handler->getPattern());
-				}
-			}
-			$interface->setName($this->name);
-			return true;
-		}
-		return false;
-	}
-
-	/**
-	 * @throws \InvalidArgumentException
-	 */
-	public function unregisterInterface(NetworkInterface $interface) : void{
-		if(!isset($this->interfaces[$hash = spl_object_id($interface)])){
-			throw new \InvalidArgumentException("Interface " . get_class($interface) . " is not registered on this network");
-		}
-		(new NetworkInterfaceUnregisterEvent($interface))->call();
-		unset($this->interfaces[$hash], $this->advancedInterfaces[$hash]);
-		$interface->shutdown();
-	}
-
-	/**
-	 * Sets the server name shown on each interface Query
-	 */
-	public function setName(string $name) : void{
-		$this->name = $name;
-		foreach($this->interfaces as $interface){
-			$interface->setName($this->name);
-		}
-	}
-
-	public function getName() : string{
-		return $this->name;
-	}
-
-	public function updateName() : void{
-		foreach($this->interfaces as $interface){
-			$interface->setName($this->name);
-		}
-	}
-
-	public function sendPacket(string $address, int $port, string $payload) : void{
-		foreach($this->advancedInterfaces as $interface){
-			$interface->sendRawPacket($address, $port, $payload);
-		}
-	}
-
-	/**
-	 * Blocks an IP address from the main interface. Setting timeout to -1 will block it forever
-	 */
-	public function blockAddress(string $address, int $timeout = 300) : void{
-		$this->bannedIps[$address] = $timeout > 0 ? time() + $timeout : PHP_INT_MAX;
-		foreach($this->advancedInterfaces as $interface){
-			$interface->blockAddress($address, $timeout);
-		}
-	}
-
-	public function unblockAddress(string $address) : void{
-		unset($this->bannedIps[$address]);
-		foreach($this->advancedInterfaces as $interface){
-			$interface->unblockAddress($address);
-		}
-	}
-
-	/**
-	 * Registers a raw packet handler on the network.
-	 */
-	public function registerRawPacketHandler(RawPacketHandler $handler) : void{
-		$this->rawPacketHandlers[spl_object_id($handler)] = $handler;
-
-		$regex = $handler->getPattern();
-		foreach($this->advancedInterfaces as $interface){
-			$interface->addRawPacketFilter($regex);
-		}
-	}
-
-	/**
-	 * Unregisters a previously-registered raw packet handler.
-	 */
-	public function unregisterRawPacketHandler(RawPacketHandler $handler) : void{
-		unset($this->rawPacketHandlers[spl_object_id($handler)]);
-	}
-
-	public function processRawPacket(AdvancedNetworkInterface $interface, string $address, int $port, string $packet) : void{
-		if(isset($this->bannedIps[$address]) && time() < $this->bannedIps[$address]){
-			$this->logger->debug("Dropped raw packet from banned address $address $port");
-			return;
-		}
-		$handled = false;
-		foreach($this->rawPacketHandlers as $handler){
-			if(preg_match($handler->getPattern(), $packet) === 1){
-				try{
-					$handled = $handler->handle($interface, $address, $port, $packet);
-				}catch(PacketHandlingException $e){
-					$handled = true;
-					$this->logger->error("Bad raw packet from /$address:$port: " . $e->getMessage());
-					$this->blockAddress($address, 600);
-					break;
-				}
-			}
-		}
-		if(!$handled){
-			$this->logger->debug("Unhandled raw packet from /$address:$port: " . base64_encode($packet));
-		}
-	}
+    /**
+     * Clears tracked protocols and sessions when a player disconnects
+     */
+    public function unregisterSession(string $address, int $port) : void {
+        $connectionId = $address . ":" . $port;
+        unset($this->connectionProtocols[$connectionId]);
+        unset($this->sessions[$connectionId]);
+    }
 }
