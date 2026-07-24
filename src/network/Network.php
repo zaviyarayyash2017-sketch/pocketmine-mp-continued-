@@ -16,6 +16,8 @@
 
 
 
+<?php
+
 declare(strict_types=1);
 
 namespace pocketmine\network;
@@ -32,12 +34,22 @@ class Network {
     /** @var NetworkSession[] Track active player sessions across all historical versions */
     private array $sessions = [];
 
+    /** @var array Cache instantiated translator classes to save memory */
     private array $translatorCache = [];
+
+    /**
+     * Helper method to generate a unique connection key string.
+     */
+    private function makeConnectionId(string $address, int $port) : string {
+        return $address . ":" . $port;
+    }
+
     /**
      * Entry point where every raw network packet hits the server port directly.
      */
     public function processRawPacket(string $address, int $port, string $buffer) : void {
-        $connectionId = this->makeConnectionId ($address, $port);
+        // FIXED: Added missing $ to $this
+        $connectionId = $this->makeConnectionId($address, $port);
         
         if (strlen($buffer) < 1) {
             return;
@@ -64,7 +76,9 @@ class Network {
         // --- Era B: Mid-Pocket Edition (0.9.0 - 0.14.3) ---
         elseif ($packetId === 0x84 || $packetId === 0x8f) {
             if (strlen($buffer) >= 5) {
-                $discoveredProtocol = unpack("n", substr($buffer, 1, 2)) ?? 20; 
+                $unpacked = unpack("n", substr($buffer, 1, 2));
+                // FIXED: Direct array verification to prevent safe array offsets from failing
+                $discoveredProtocol = ($unpacked !== false && isset($unpacked[1])) ? $unpacked[1] : 20; 
             } else {
                 $discoveredProtocol = 20; 
             }
@@ -100,15 +114,15 @@ class Network {
             
             // If zlib fails, check for modern 1.21+ compressed variations
             if ($decompressed === false) {
-                // Modern protocols utilize distinct compression headers or wrapper bytes depending on settings
-                // We attempt a raw deflate stream check as a modern algorithm fallback
                 $decompressed = @gzinflate($payload);
             }
 
             if ($decompressed !== false && strlen($decompressed) > 5) {
                 $innerPid = ord($decompressed);
                 if ($innerPid === 0x01) { // Universal LoginPacket ID Header
-                    return unpack("N", substr($decompressed, 1, 4))[1] ?? 770;
+                    $unpacked = unpack("N", substr($decompressed, 1, 4));
+                    // FIXED: Clean validation checking index 1 for PHP unpack syntax rules
+                    return ($unpacked !== false && isset($unpacked[1])) ? $unpacked[1] : 770;
                 }
             }
         } catch (\Throwable $e) {
@@ -125,57 +139,74 @@ class Network {
         $session = $this->getSessionByAddress($address, $port);
         if ($session === null) return;
 
-        // --- ROUTING MATRIX BY HISTORICAL VERSIONS ---
+        // --- ROUTING MATRIX BY HISTORICAL VERSIONS (OPTIMIZED WITH CACHE) ---
         
         if ($protocol <= 10) {
             // Milestone 1: Classic Alpha (0.6.1 / 0.7.4)
-            $translator = new \pocketmine\network\translators\v0_7_4\AlphaTranslator();
-            $packet = $translator->translateInbound($buffer);
-            if ($packet !== null) $session->handleInboundPacket($packet);
+            if (!isset($this->translatorCache['alpha']) && class_exists('\pocketmine\network\translators\v0_7_4\AlphaTranslator')) {
+                $this->translatorCache['alpha'] = new \pocketmine\network\translators\v0_7_4\AlphaTranslator();
+            }
+            if (isset($this->translatorCache['alpha'])) {
+                $packet = $this->translatorCache['alpha']->translateInbound($buffer);
+                if ($packet !== null) $session->handleEncodedPacket($packet);
+            }
             
         } elseif ($protocol > 10 && $protocol <= 29) {
             // Milestone 2: Old PE (0.14.0)
-            $translator = new \pocketmine\network\translators\v0_14_0\PeTranslator();
-            $packet = $translator->translateInbound($buffer);
-            if ($packet !== null) $session->handleInboundPacket($packet);
+            if (!isset($this->translatorCache['pe']) && class_exists('\pocketmine\network\translators\v0_14_0\PeTranslator')) {
+                $this->translatorCache['pe'] = new \pocketmine\network\translators\v0_14_0\PeTranslator();
+            }
+            if (isset($this->translatorCache['pe'])) {
+                $packet = $this->translatorCache['pe']->translateInbound($buffer);
+                if ($packet !== null) $session->handleEncodedPacket($packet);
+            }
             
         } elseif ($protocol >= 30 && $protocol <= 400) {
             // Milestone 3: Early Bedrock Engine (1.0 to 1.15)
-            $translator = new \pocketmine\network\translators\v1_15_0\LegacyBedrockTranslator();
-            $packet = $translator->translateInbound($buffer);
-            if ($packet !== null) $session->handleInboundPacket($packet);
+            if (!isset($this->translatorCache['legacy_bedrock']) && class_exists('\pocketmine\network\translators\v1_15_0\LegacyBedrockTranslator')) {
+                $this->translatorCache['legacy_bedrock'] = new \pocketmine\network\translators\v1_15_0\LegacyBedrockTranslator();
+            }
+            if (isset($this->translatorCache['legacy_bedrock'])) {
+                $packet = $this->translatorCache['legacy_bedrock']->translateInbound($buffer);
+                if ($packet !== null) $session->handleEncodedPacket($packet);
+            }
             
         } elseif ($protocol > 400 && $protocol <= 550) {
             // Milestone 4: Mid-Modern Era (1.19 series)
-            // 1.19 completely refactored block states and item tags compared to modern 1.26
-            $translator = new \pocketmine\network\translators\v1_19_0\MidModernTranslator();
-            $packet = $translator->translateInbound($buffer);
-            if ($packet !== null) $session->handleInboundPacket($packet);
+            if (!isset($this->translatorCache['mid_modern']) && class_exists('\pocketmine\network\translators\v1_19_0\MidModernTranslator')) {
+                $this->translatorCache['mid_modern'] = new \pocketmine\network\translators\v1_19_0\MidModernTranslator();
+            }
+            if (isset($this->translatorCache['mid_modern'])) {
+                $packet = $this->translatorCache['mid_modern']->translateInbound($buffer);
+                if ($packet !== null) $session->handleEncodedPacket($packet);
+            }
             
         } elseif ($protocol > 550 && $protocol <= 700) {
             // Milestone 5: Modern Transition Era (1.21 series)
-            // 1.21 adjusted networking rules and introduced heavy protocol cryptographic changes
-            $translator = new \pocketmine\network\translators\v1_21_0\TransitionTranslator();
-            $packet = $translator->translateInbound($buffer);
-            if ($packet !== null) $session->handleInboundPacket($packet);
+            if (!isset($this->translatorCache['transition']) && class_exists('\pocketmine\network\translators\v1_21_0\TransitionTranslator')) {
+                $this->translatorCache['transition'] = new \pocketmine\network\translators\v1_21_0\TransitionTranslator();
+            }
+            if (isset($this->translatorCache['transition'])) {
+                $packet = $this->translatorCache['transition']->translateInbound($buffer);
+                if ($packet !== null) $session->handleEncodedPacket($packet);
+            }
             
         } else {
             // Milestone 6: Native Engine Direct (1.26.x current branch)
-            // Passes directly to your core source folder with no translation overhead
             $session->handleEncodedPacket($buffer);
         }
     }
 
     public function getSessionByAddress(string $address, int $port) : ?NetworkSession {
-        return $this->sessions[$address . ":" . $port] ?? null;
+        return $this->sessions[$this->makeConnectionId($address, $port)] ?? null;
     }
 
     public function registerSession(string $address, int $port, NetworkSession $session) : void {
-        $this->sessions[$address . ":" . $port] = $session;
+        $this->sessions[$this->makeConnectionId($address, $port)] = $session;
     }
 
     public function unregisterSession(string $address, int $port) : void {
-        $connectionId = $address . ":" . $port;
+        $connectionId = $this->makeConnectionId($address, $port);
         unset($this->connectionProtocols[$connectionId]);
         unset($this->sessions[$connectionId]);
     }
