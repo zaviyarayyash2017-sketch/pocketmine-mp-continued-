@@ -37,7 +37,7 @@ class Network {
      * Entry point where every raw network packet hits the server port directly.
      */
     public function processRawPacket(string $address, int $port, string $buffer) : void {
-        $connectionId = $address . ":" . $port;
+        $connectionId = this->makeConnectionId $address $port
         
         if (strlen($buffer) < 1) {
             return;
