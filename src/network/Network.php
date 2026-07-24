@@ -47,7 +47,7 @@ class Network {
         $packetId = ord($buffer);
 
         // =================================================================
-        // PHASE 1: ROUTING NEW OR EXISTING ALPHA CLIENTS (v0.6.1 - v0.7.4)
+        //  ROUTING NEW OR EXISTING ALPHA CLIENTS (v0.6.1 - v0.7.4)
         // =================================================================
         
         // Old alpha clients initiated connections with raw UDP bytes like 0x05, 0x06, or 0x09.
